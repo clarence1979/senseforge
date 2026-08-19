@@ -587,6 +587,13 @@ body {
   width: 40px; height: 21px; padding: 0; border: 1px solid var(--edge);
   border-radius: 4px; background: var(--panel-2); cursor: pointer;
 }
+/* speaker lamp — lights while the emulated espeak voice is talking */
+.spk-led {
+  font-size: 12px; line-height: 1; opacity: .22;
+  transition: opacity .15s ease; filter: grayscale(1);
+}
+.spk-led.on { opacity: 1; filter: none; animation: spk-pulse .7s ease-in-out infinite; }
+@keyframes spk-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.22); } }
 .strip-spacer { flex: 1; }
 #adv-orient { font-family: var(--mono); font-size: 11px; }
 #adv-orient summary { color: var(--silk-dim); cursor: pointer; padding: 2px 0; }
@@ -848,6 +855,10 @@ body {
         <label class="strip-toggle" title="Simulate real sensor noise and drift">
           <input type="checkbox" id="cb-noise" checked> noise &amp; drift
         </label>
+        <label class="strip-toggle" title="Emulated espeak voice &mdash; os.system('espeak &quot;hello&quot;')">
+          <input type="checkbox" id="cb-speaker" checked> speaker
+          <span id="spk-led" class="spk-led" aria-hidden="true">&#128266;</span>
+        </label>
         <button id="btn-level" class="mini-btn" title="Reset orientation to flat">level</button>
         <span class="strip-spacer"></span>
         <details id="adv-orient">
@@ -987,8 +998,22 @@ sense.show_message("Hello!")</pre>
       <h3>Python</h3>
       <p>Python 3 (Skulpt — the same engine trinket uses). <code>input()</code> prompts in the console.
       Working modules: <code>math, random, time, re, string, itertools, functools, operator,
-      collections, datetime, bisect, copy, json, numpy, matplotlib.pyplot, turtle</code>.
+      collections, datetime, bisect, copy, json, os, subprocess, numpy, matplotlib.pyplot, turtle</code>.
       <code>import sense_emu</code> is an alias of <code>sense_hat</code>.</p>
+      <h3>Sound — making the Pi talk</h3>
+      <pre>import os
+temp = round(sense.get_temperature(), 1)
+os.system('espeak "' + str(temp) + ' degrees"')</pre>
+      <p><code>os.system()</code> runs an emulated shell and blocks until the phrase finishes, exactly
+      like <code>espeak</code> on the Pi, so <code>time.sleep(5)</code> still matters in a loop.
+      Recognised flags: <code>-s</code> speed (wpm) · <code>-p</code> pitch · <code>-a</code> volume ·
+      <code>-v</code> voice (e.g. <code>en+f3</code>) · <code>--voices</code>. The voice comes from the
+      browser's own speech synthesiser where that works, and otherwise from a formant synthesiser built
+      into this file — so it still talks on Linux machines with no <code>speech-dispatcher</code> installed,
+      and with no network. Force one or the other with <code>-v robot</code> or <code>-v system</code>.
+      Untick <strong>speaker</strong> in the strip above to mute it; the timing stays the same. Also available: <code>echo</code>, <code>sleep</code>, <code>date</code>,
+      <code>whoami</code>, and <code>subprocess.run([...])</code>. Anything else answers like a real shell:
+      <code>sh: 1: wibble: not found</code> with exit status 127.</p>
       <h3>Graphs and graphics</h3>
       <pre>import matplotlib.pyplot as plt
 plt.bar(["Mon", "Tue", "Wed"], [4, 7, 5])
@@ -14407,6 +14432,1520 @@ var $builtinmodule = function () {
 
 </script>
 <script>
+/* ============================================================
+   SENSE VOICE — a small formant speech synthesiser.
+   ------------------------------------------------------------
+   espeak on the Pi is a formant synthesiser: a buzz through a
+   handful of resonators. This is the same idea in about 700
+   lines of plain JavaScript, so the emulator can talk on any
+   machine with Web Audio — including the Linux boxes where the
+   browser's own speechSynthesis has no voices installed.
+
+   text -> normalised words -> phonemes -> 5 ms parameter frames
+        -> glottal pulses + noise through three resonators -> PCM
+
+   Rendering is environment-free (it just fills a Float32Array),
+   so the same code renders in Node for testing and plays through
+   an AudioBufferSourceNode in the browser.
+   ============================================================ */
+(function (root) {
+  'use strict';
+
+  /* ---------------------------------------------------------
+     1. Phoneme inventory
+     Vowel formants are the classic Peterson–Barney averages;
+     consonants carry the locus their neighbouring vowel bends
+     towards, which is what makes a plosive sound like /b/
+     rather than /d/.
+     --------------------------------------------------------- */
+  var LOCUS = {
+    lab: [330, 800, 2100],    /* p b m f v   */
+    alv: [330, 1750, 2600],   /* t d n s z l */
+    vel: [300, 1900, 2300],   /* k g ng      */
+    pal: [320, 1900, 2500]    /* sh zh ch jh */
+  };
+
+  var PH = {
+    /* --- vowels: f = target, g = glide target for diphthongs --- */
+    IY: { t: 'v', f: [290, 2270, 3000], d: 105 },
+    IH: { t: 'v', f: [400, 1990, 2550], d: 80 },
+    EH: { t: 'v', f: [530, 1840, 2480], d: 95 },
+    AE: { t: 'v', f: [660, 1720, 2410], d: 120 },
+    AA: { t: 'v', f: [730, 1100, 2450], d: 120 },
+    AO: { t: 'v', f: [570, 880, 2410], d: 115 },
+    UH: { t: 'v', f: [440, 1020, 2240], d: 80 },
+    UW: { t: 'v', f: [310, 870, 2250], d: 110 },
+    AH: { t: 'v', f: [620, 1220, 2400], d: 85 },
+    ER: { t: 'v', f: [490, 1350, 1690], d: 120 },
+    AX: { t: 'v', f: [550, 1400, 2400], d: 55 },
+    EY: { t: 'v', f: [480, 1800, 2500], g: [330, 2200, 2900], d: 150 },
+    AY: { t: 'v', f: [700, 1150, 2450], g: [350, 2100, 2850], d: 170 },
+    OY: { t: 'v', f: [560, 880, 2400], g: [350, 2050, 2850], d: 185 },
+    AW: { t: 'v', f: [700, 1200, 2450], g: [340, 900, 2300], d: 175 },
+    OW: { t: 'v', f: [520, 900, 2400], g: [330, 850, 2300], d: 150 },
+
+    /* --- nasals --- */
+    M: { t: 'n', f: [260, 1000, 2100], d: 65 },
+    N: { t: 'n', f: [260, 1650, 2600], d: 60 },
+    NG: { t: 'n', f: [260, 2000, 2700], d: 70 },
+
+    /* --- liquids and glides --- */
+    L: { t: 'l', f: [380, 1050, 2650], d: 60, av: 0.85 },
+    R: { t: 'l', f: [330, 1000, 1600], d: 65, av: 0.85 },
+    W: { t: 'l', f: [300, 700, 2150], d: 55, av: 0.8 },
+    Y: { t: 'l', f: [280, 2200, 3000], d: 50, av: 0.8 },
+
+    /* --- fricatives --- */
+    F: { t: 'f', f: LOCUS.lab, nf: 5200, nbw: 3000, na: 0.16, d: 95 },
+    V: { t: 'f', f: LOCUS.lab, nf: 4800, nbw: 3000, na: 0.09, d: 65, voiced: true },
+    TH: { t: 'f', f: LOCUS.alv, nf: 6200, nbw: 3200, na: 0.13, d: 90 },
+    DH: { t: 'f', f: LOCUS.alv, nf: 5800, nbw: 3200, na: 0.08, d: 50, voiced: true },
+    S: { t: 'f', f: LOCUS.alv, nf: 5800, nbw: 1300, na: 0.50, d: 105 },
+    Z: { t: 'f', f: LOCUS.alv, nf: 5400, nbw: 1300, na: 0.26, d: 80, voiced: true },
+    SH: { t: 'f', f: LOCUS.pal, nf: 2900, nbw: 1400, na: 0.55, d: 110 },
+    ZH: { t: 'f', f: LOCUS.pal, nf: 2700, nbw: 1400, na: 0.28, d: 85, voiced: true },
+    HH: { t: 'h', na: 0.16, d: 55 },
+
+    /* --- plosives: closure, burst, then aspiration if voiceless --- */
+    P: { t: 'p', f: LOCUS.lab, nf: 1000, nbw: 2500, na: 0.42, d: 75 },
+    B: { t: 'p', f: LOCUS.lab, nf: 900, nbw: 2500, na: 0.24, d: 60, voiced: true },
+    T: { t: 'p', f: LOCUS.alv, nf: 3900, nbw: 2200, na: 0.48, d: 75 },
+    D: { t: 'p', f: LOCUS.alv, nf: 3600, nbw: 2200, na: 0.26, d: 58, voiced: true },
+    K: { t: 'p', f: LOCUS.vel, nf: 2100, nbw: 1800, na: 0.48, d: 80 },
+    G: { t: 'p', f: LOCUS.vel, nf: 1900, nbw: 1800, na: 0.26, d: 60, voiced: true },
+
+    /* --- affricates expand to stop + fricative --- */
+    CH: { t: 'x', parts: ['T2', 'SH'] },
+    JH: { t: 'x', parts: ['D2', 'ZH'] },
+    T2: { t: 'p', f: LOCUS.pal, nf: 3000, nbw: 2200, na: 0.30, d: 60, noAsp: true },
+    D2: { t: 'p', f: LOCUS.pal, nf: 2800, nbw: 2200, na: 0.20, d: 50, voiced: true, noAsp: true },
+
+    PAU: { t: 'q', d: 70 }
+  };
+
+  var VOWELS = 'IY IH EH AE AA AO UH UW AH ER AX EY AY OY AW OW'.split(' ');
+  function isVowel(p) { return VOWELS.indexOf(p) !== -1; }
+
+  /* ---------------------------------------------------------
+     2. Text normalisation — numbers matter most here, because
+     every temperature the lab prints goes through this.
+     --------------------------------------------------------- */
+  var ONES = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
+    'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen',
+    'seventeen', 'eighteen', 'nineteen'];
+  var TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+
+  function intToWords(n) {
+    n = Math.floor(Math.abs(n));
+    if (n < 20) return ONES[n];
+    if (n < 100) return TENS[Math.floor(n / 10)] + (n % 10 ? ' ' + ONES[n % 10] : '');
+    if (n < 1000) return ONES[Math.floor(n / 100)] + ' hundred' + (n % 100 ? ' and ' + intToWords(n % 100) : '');
+    if (n < 1000000) return intToWords(Math.floor(n / 1000)) + ' thousand' + (n % 1000 ? ' ' + intToWords(n % 1000) : '');
+    return intToWords(Math.floor(n / 1000000)) + ' million' + (n % 1000000 ? ' ' + intToWords(n % 1000000) : '');
+  }
+
+  function numberToWords(text) {
+    return String(text).replace(/-?\d+(\.\d+)?/g, function (m) {
+      var neg = m.charAt(0) === '-';
+      if (neg) m = m.slice(1);
+      var bits = m.split('.');
+      var whole = intToWords(parseInt(bits[0], 10) || 0);
+      var out = (neg ? 'minus ' : '') + whole;
+      if (bits.length > 1) {
+        out += ' point';
+        for (var i = 0; i < bits[1].length; i++) out += ' ' + ONES[parseInt(bits[1].charAt(i), 10)];
+      }
+      return out;
+    });
+  }
+
+  var SYMBOLS = {
+    '%': ' percent ', '&': ' and ', '+': ' plus ', '=': ' equals ', '@': ' at ',
+    '\u00b0': ' degrees ', '\u00b5': ' micro ', '$': ' dollars ', '#': ' number ',
+    '/': ' slash ', '*': ' star ', '_': ' ', '<': ' less than ', '>': ' greater than '
+  };
+
+  function normalise(text) {
+    var s = ' ' + String(text) + ' ';
+    s = s.replace(/[\u2018\u2019]/g, "'").replace(/[\u201c\u201d]/g, '"');
+    s = s.replace(/[%&+=@\u00b0\u00b5$#\/*_<>]/g, function (c) { return SYMBOLS[c] || ' '; });
+    s = numberToWords(s);
+    return s;
+  }
+
+  /* ---------------------------------------------------------
+     3. Grapheme to phoneme: a dictionary for the words this
+     emulator says most, then context rules for everything else.
+     --------------------------------------------------------- */
+  var DICT = {
+    a: 'AX', the: 'DH AX', to: 'T UW', too: 'T UW', two: 'T UW', of: 'AH V',
+    is: 'IH Z', it: 'IH T', its: 'IH T S', in: 'IH N', on: 'AA N', off: 'AO F',
+    i: 'AY', you: 'Y UW', your: 'Y AO R', my: 'M AY', me: 'M IY', we: 'W IY',
+    are: 'AA R', was: 'W AH Z', were: 'W ER', be: 'B IY', been: 'B IH N',
+    do: 'D UW', does: 'D AH Z', done: 'D AH N', go: 'G OW', goes: 'G OW Z',
+    have: 'HH AE V', has: 'HH AE Z', had: 'HH AE D', what: 'W AA T',
+    who: 'HH UW', where: 'W EH R', there: 'DH EH R', here: 'HH IH R',
+    one: 'W AH N', once: 'W AH N S', four: 'F AO R', eight: 'EY T',
+    said: 'S EH D', says: 'S EH Z', again: 'AX G EH N', any: 'EH N IY',
+    many: 'M EH N IY', very: 'V EH R IY', every: 'EH V R IY',
+    some: 'S AH M', come: 'K AH M', comes: 'K AH M Z', give: 'G IH V',
+    live: 'L IH V', love: 'L AH V', move: 'M UW V', prove: 'P R UW V',
+    put: 'P UH T', push: 'P UH SH', pull: 'P UH L', full: 'F UH L',
+    could: 'K UH D', would: 'W UH D', should: 'SH UH D', good: 'G UH D',
+    book: 'B UH K', look: 'L UH K', took: 'T UH K', foot: 'F UH T',
+
+    /* the lab's own vocabulary */
+    degrees: 'D IH G R IY Z', degree: 'D IH G R IY',
+    celsius: 'S EH L S IY AX S', temperature: 'T EH M P R AX CH ER',
+    humidity: 'HH Y UW M IH D IH T IY', pressure: 'P R EH SH ER',
+    hot: 'HH AA T', cold: 'K OW L D', warm: 'W AO R M', cool: 'K UW L',
+    hello: 'HH AX L OW', world: 'W ER L D', alarm: 'AX L AA R M',
+    warning: 'W AO R N IH NG', danger: 'D EY N JH ER', error: 'EH R ER',
+    sense: 'S EH N S', hat: 'HH AE T', raspberry: 'R AA Z B EH R IY',
+    pi: 'P AY', python: 'P AY TH AA N', forge: 'F AO R JH',
+    red: 'R EH D', green: 'G R IY N', blue: 'B L UW', yellow: 'Y EH L OW',
+    orange: 'AO R IH N JH', purple: 'P ER P AX L', white: 'W AY T',
+    black: 'B L AE K', colour: 'K AH L ER', color: 'K AH L ER',
+    joystick: 'JH OY S T IH K', button: 'B AH T AX N', pixel: 'P IH K S AX L',
+    matrix: 'M EY T R IH K S', sensor: 'S EH N S ER', reading: 'R IY D IH NG',
+    up: 'AH P', down: 'D AW N', left: 'L EH F T', right: 'R AY T',
+    middle: 'M IH D AX L', start: 'S T AA R T', stop: 'S T AA P',
+    ready: 'R EH D IY', finished: 'F IH N IH SH T', done_: 'D AH N',
+    yes: 'Y EH S', no: 'N OW', okay: 'OW K EY', ok: 'OW K EY',
+    high: 'HH AY', low: 'L OW', now: 'N AW', point: 'P OY N T',
+    minus: 'M AY N AX S', percent: 'P ER S EH N T', number: 'N AH M B ER',
+    hundred: 'HH AH N D R AX D', thousand: 'TH AW Z AX N D',
+    million: 'M IH L Y AX N', zero: 'Z IH R OW',
+    three: 'TH R IY', five: 'F AY V', nine: 'N AY N', twelve: 'T W EH L V',
+    twenty: 'T W EH N T IY', thirty: 'TH ER T IY', forty: 'F AO R T IY',
+    fifty: 'F IH F T IY', sixty: 'S IH K S T IY', seventy: 'S EH V AX N T IY',
+    eighty: 'EY T IY', ninety: 'N AY N T IY',
+    thirteen: 'TH ER T IY N', fifteen: 'F IH F T IY N',
+    eighteen: 'EY T IY N', nineteen: 'N AY N T IY N'
+  };
+
+  var VOW = 'aeiouy';
+  var FRONT = 'eiy';
+  var VOICED_C = 'bdgjlmnrvwz';
+
+  function isV(c) { return VOW.indexOf(c) !== -1; }
+  function isC(c) { return c >= 'a' && c <= 'z' && !isV(c); }
+
+  /* NRL-style context matching. '#' vowels, '^' one consonant,
+     ':' zero or more consonants, '+' front vowel, '.' voiced
+     consonant, '%' common suffix, ' ' word boundary. */
+  function matchRight(w, i, pat) {
+    var p = 0;
+    while (p < pat.length) {
+      var c = pat.charAt(p++);
+      if (c === '#') { if (!isV(w.charAt(i))) return -1; while (isV(w.charAt(i))) i++; }
+      else if (c === ':') { while (isC(w.charAt(i))) i++; }
+      else if (c === '^') { if (!isC(w.charAt(i))) return -1; i++; }
+      else if (c === '+') { if (FRONT.indexOf(w.charAt(i)) === -1) return -1; i++; }
+      else if (c === '.') { if (VOICED_C.indexOf(w.charAt(i)) === -1) return -1; i++; }
+      else if (c === '%') {
+        var rest = w.slice(i);
+        var sufs = ['ely', 'ing', 'ers', 'ful', 'es', 'ed', 'er', 'e'];
+        var hit = null;
+        for (var s = 0; s < sufs.length; s++) {
+          if (rest.indexOf(sufs[s]) === 0) { hit = sufs[s]; break; }
+        }
+        if (hit === null) return -1;
+        i += hit.length;
+      } else { if (w.charAt(i) !== c) return -1; i++; }
+    }
+    return i;
+  }
+
+  function matchLeft(w, i, pat) {
+    var p = pat.length - 1;
+    while (p >= 0) {
+      var c = pat.charAt(p--);
+      if (c === '#') { if (!isV(w.charAt(i - 1))) return false; while (isV(w.charAt(i - 1))) i--; }
+      else if (c === ':') { while (isC(w.charAt(i - 1))) i--; }
+      else if (c === '^') { if (!isC(w.charAt(i - 1))) return false; i--; }
+      else if (c === '+') { if (FRONT.indexOf(w.charAt(i - 1)) === -1) return false; i--; }
+      else if (c === '.') { if (VOICED_C.indexOf(w.charAt(i - 1)) === -1) return false; i--; }
+      else { if (w.charAt(i - 1) !== c) return false; i--; }
+    }
+    return true;
+  }
+
+  /* [left, letters, right, phonemes] — first match wins */
+  var RULES = {
+    ' ': [['', ' ', '', '']],
+    a: [
+      ['', 'are ', '', 'AA R'], ['', 'ar', 'o', 'AX R'], [' ', 'a', ' ', 'AX'],
+      ['', 'ai', '', 'EY'], ['', 'ay', '', 'EY'], ['', 'au', '', 'AO'], ['', 'aw', '', 'AO'],
+      ['', 'all', '', 'AO L'], ['', 'alk', '', 'AO K'], ['', 'alm', '', 'AA M'],
+      ['', 'ang', '', 'AE NG'], ['', 'ank', '', 'AE NG K'],
+      ['', 'a', 'r ', 'AA'], ['', 'ar', '^', 'AA R'],
+      ['', 'a', '^#', 'EY'], ['', 'a', '^+', 'EY'], ['', 'a', 'ble', 'EY'],
+      [' ', 'a', '^^', 'AX'], ['', 'a', '', 'AE']
+    ],
+    b: [['', 'bb', '', 'B'], ['', 'b', '', 'B']],
+    c: [
+      ['', 'ch', '^', 'K'], ['', 'ch', '', 'CH'], ['', 'ck', '', 'K'],
+      ['', 'ci', 'a', 'SH'], ['', 'c', '+', 'S'], ['', 'cc', '', 'K'], ['', 'c', '', 'K']
+    ],
+    d: [
+      ['#:', 'ed', ' ', 'D'], ['^', 'ed', ' ', 'D'], ['t', 'ed', ' ', 'IH D'],
+      ['d', 'ed', ' ', 'IH D'], ['', 'dg', '+', 'JH'], ['', 'dd', '', 'D'], ['', 'd', '', 'D']
+    ],
+    e: [
+      /* -ed and -es endings, which decide half the past tenses in English */
+      ['t', 'ed', ' ', 'IH D'], ['d', 'ed', ' ', 'IH D'],
+      ['p', 'ed', ' ', 'T'], ['k', 'ed', ' ', 'T'], ['f', 'ed', ' ', 'T'],
+      ['s', 'ed', ' ', 'T'], ['h', 'ed', ' ', 'T'], ['x', 'ed', ' ', 'T'],
+      ['c', 'ed', ' ', 'T'], ['#', 'ed', ' ', 'D'], ['.', 'ed', ' ', 'D'],
+      ['s', 'es', ' ', 'IH Z'], ['h', 'es', ' ', 'IH Z'], ['x', 'es', ' ', 'IH Z'],
+      ['z', 'es', ' ', 'IH Z'], ['g', 'es', ' ', 'IH Z'], ['', 'es', ' ', 'Z'],
+      ['', 'ee', '', 'IY'], ['', 'ea', 'r ', 'IH'], ['', 'ear', '^', 'ER'],
+      ['', 'ea', '', 'IY'], ['', 'ei', '', 'IY'], ['', 'eigh', '', 'EY'],
+      ['', 'ey', '', 'IY'], ['', 'eu', '', 'Y UW'], ['', 'ew', '', 'UW'],
+      ['', 'er', ' ', 'ER'], ['', 'er', '^', 'ER'], ['', 'e', 'r ', 'ER'],
+      ['#:^', 'e', ' ', ''], [' :', 'e', ' ', 'IY'],
+      ['', 'e', '^#', 'IY'], ['', 'e', '', 'EH']
+    ],
+    f: [['', 'ff', '', 'F'], ['', 'f', '', 'F']],
+    g: [
+      ['', 'gh', '', ''], ['', 'gn', '', 'N'], ['', 'gg', '', 'G'],
+      ['', 'g', 'i', 'JH'], ['', 'g', 'e', 'JH'], ['', 'g', 'y', 'JH'], ['', 'g', '', 'G']
+    ],
+    h: [['', 'hh', '', 'HH'], [' ', 'h', '', 'HH'], ['', 'h', '#', 'HH'], ['', 'h', '', '']],
+    i: [
+      ['', 'ie', ' ', 'IY'], ['', 'ie', '', 'IY'], ['', 'igh', '', 'AY'],
+      ['', 'ir', '', 'ER'], ['', 'ind', ' ', 'AY N D'], ['', 'ild', ' ', 'AY L D'],
+      ['', 'ing', ' ', 'IH NG'], ['', 'ion', '', 'Y AX N'],
+      ['', 'i', '^#', 'AY'], ['', 'i', '^+', 'AY'], ['', 'i', '', 'IH']
+    ],
+    j: [['', 'j', '', 'JH']],
+    k: [['', 'kn', '', 'N'], ['', 'k', '', 'K']],
+    l: [['', 'll', '', 'L'], ['', 'l', '', 'L']],
+    m: [['', 'mm', '', 'M'], ['', 'm', '', 'M']],
+    n: [
+      ['', 'ng', ' ', 'NG'], ['', 'ng', '^', 'NG'], ['', 'nk', '', 'NG K'],
+      ['', 'nn', '', 'N'], ['', 'n', '', 'N']
+    ],
+    o: [
+      ['', 'oo', 'k', 'UH'], ['', 'oo', 'd ', 'UH'], ['', 'oo', '', 'UW'],
+      ['', 'ou', 'ld', 'UH'], ['', 'our', '', 'AO R'], ['', 'ou', '', 'AW'],
+      ['', 'ow', '#', 'OW'], ['', 'ow', ' ', 'OW'], ['', 'ow', '', 'AW'],
+      ['', 'oi', '', 'OY'], ['', 'oy', '', 'OY'], ['', 'oa', '', 'OW'],
+      ['', 'or', '', 'AO R'], ['', 'oe', ' ', 'OW'],
+      ['', 'o', 'x', 'AA'], ['', 'o', '^#', 'OW'], ['', 'o', '^+', 'OW'], ['', 'o', 'ld', 'OW'],
+      ['', 'o', 'st ', 'OW'], ['', 'o', '', 'AA']
+    ],
+    p: [['', 'ph', '', 'F'], ['', 'pp', '', 'P'], [' ', 'ps', '', 'S'], ['', 'p', '', 'P']],
+    q: [['', 'qu', '', 'K W'], ['', 'q', '', 'K']],
+    r: [[' ', 'rh', '', 'R'], ['', 'rr', '', 'R'], ['', 'r', '', 'R']],
+    s: [
+      ['', 'sh', '', 'SH'], ['', 'sion', '', 'ZH AX N'], ['', 'ssion', '', 'SH AX N'],
+      ['', 'sure', '', 'SH ER'], ['', 'ss', '', 'S'],
+      ['#', 's', ' ', 'Z'], ['.', 's', ' ', 'Z'], ['', 's', '', 'S']
+    ],
+    t: [
+      ['', 'tion', '', 'SH AX N'], ['', 'tch', '', 'CH'], ['', 'th', '#', 'TH'],
+      [' ', 'the', ' ', 'DH AX'], ['', 'ther', '', 'DH ER'], ['', 'th', '', 'TH'],
+      ['', 'ture', '', 'CH ER'], ['', 'tt', '', 'T'], ['', 't', '', 'T']
+    ],
+    u: [
+      ['', 'ur', '', 'ER'], ['', 'ui', '', 'UW'], ['', 'ue', '', 'UW'],
+      ['', 'u', '^#', 'Y UW'], ['g', 'u', '', 'AH'], ['r', 'u', '', 'UW'],
+      ['l', 'u', '', 'UW'], ['j', 'u', '', 'UW'], ['', 'u', '', 'AH']
+    ],
+    v: [['', 'v', '', 'V']],
+    w: [
+      ['', 'wr', '', 'R'], ['', 'wh', '', 'W'], ['', 'wa', '^', 'W AA'],
+      ['', 'w', '', 'W']
+    ],
+    x: [[' ', 'x', '', 'Z'], ['', 'x', '', 'K S']],
+    y: [
+      ['', 'y', ' ', 'IY'], [' ', 'y', '', 'Y'], ['', 'y', '^#', 'AY'],
+      ['^', 'y', '^', 'IH'], ['', 'y', '', 'IY']
+    ],
+    z: [['', 'zz', '', 'Z'], ['', 'z', '', 'Z']],
+    "'": [['', "'s", ' ', 'Z'], ['', "'t", '', 'T'], ['', "'", '', '']]
+  };
+
+  function rulesToPhonemes(word) {
+    var w = ' ' + word + ' ';
+    var out = [], i = 1;
+    var guard = 0;
+    while (i < w.length - 1 && guard++ < 400) {
+      var letter = w.charAt(i);
+      var set = RULES[letter];
+      if (!set) { i++; continue; }
+      var matched = false;
+      for (var r = 0; r < set.length; r++) {
+        var rule = set[r];
+        if (w.slice(i, i + rule[1].length) !== rule[1]) continue;
+        var after = i + rule[1].length;
+        if (rule[2] && matchRight(w, after, rule[2]) === -1) continue;
+        if (rule[0] && !matchLeft(w, i, rule[0])) continue;
+        if (rule[3]) out = out.concat(rule[3].split(' '));
+        i = after;
+        matched = true;
+        break;
+      }
+      if (!matched) i++;
+    }
+    return out;
+  }
+
+  function wordToPhonemes(word) {
+    var clean = word.toLowerCase().replace(/[^a-z']/g, '');
+    if (!clean) return [];
+    if (DICT[clean]) return DICT[clean].split(' ');
+    /* plural / past of a known word */
+    var m = /^(.*?)(s|es|ed|ing)$/.exec(clean);
+    if (m) {
+      var stem = DICT[m[1]] ? m[1] : (DICT[m[1] + 'e'] ? m[1] + 'e' : null);
+      if (stem) {
+        var base = DICT[stem].split(' ');
+        var last = base[base.length - 1];
+        var sibilant = ['S', 'Z', 'SH', 'ZH', 'CH', 'JH'].indexOf(last) !== -1;
+        var voiceless = ['P', 'T', 'K', 'F', 'TH', 'S', 'SH', 'CH'].indexOf(last) !== -1;
+        if (m[2] === 's' || m[2] === 'es') {
+          base = base.concat(sibilant ? ['IH', 'Z'] : [voiceless ? 'S' : 'Z']);
+        } else if (m[2] === 'ed') {
+          base = base.concat(last === 'T' || last === 'D' ? ['IH', 'D'] : [voiceless ? 'T' : 'D']);
+        } else base = base.concat(['IH', 'NG']);
+        return base;
+      }
+    }
+    var ph = rulesToPhonemes(clean);
+    return ph.length ? ph : ['AX'];
+  }
+
+  /* stress: first vowel of a multi-syllable word, or the only vowel */
+  function markStress(phones) {
+    var out = [], seen = false;
+    for (var i = 0; i < phones.length; i++) {
+      var stressed = false;
+      if (!seen && isVowel(phones[i])) { stressed = true; seen = true; }
+      out.push({ p: phones[i], s: stressed });
+    }
+    return out;
+  }
+
+  function textToPhones(text) {
+    var s = normalise(text);
+    var chunks = s.split(/([.,;:!?])/);
+    var seq = [];
+    chunks.forEach(function (chunk) {
+      if (/^[.,;:!?]$/.test(chunk)) {
+        seq.push({ p: 'PAU', s: false, d: /[.!?]/.test(chunk) ? 260 : 160 });
+        return;
+      }
+      chunk.split(/\s+/).forEach(function (word) {
+        if (!word) return;
+        var ph = wordToPhonemes(word);
+        if (!ph.length) return;
+        seq = seq.concat(markStress(ph));
+        seq.push({ p: 'PAU', s: false, d: 38 });
+      });
+    });
+    while (seq.length && seq[seq.length - 1].p === 'PAU') seq.pop();
+    return seq;
+  }
+
+  /* ---------------------------------------------------------
+     4. Phones -> 5 ms parameter frames
+     --------------------------------------------------------- */
+  var FRAME_MS = 5;
+
+  function buildFrames(seq, rate) {
+    var frames = [];
+    var expanded = [];
+    seq.forEach(function (item) {
+      var def = PH[item.p];
+      if (!def) return;
+      if (def.t === 'x') {
+        def.parts.forEach(function (part, n) {
+          expanded.push({ p: part, s: n === 0 ? item.s : false });
+        });
+      } else expanded.push(item);
+    });
+
+    function nextVowelF(from) {
+      for (var i = from; i < expanded.length; i++) {
+        var d = PH[expanded[i].p];
+        if (d && d.f) return d.f;
+      }
+      return [500, 1500, 2500];
+    }
+
+    var last = [500, 1500, 2500];
+    expanded.forEach(function (item, idx) {
+      var def = PH[item.p];
+      var dur = (item.d || def.d) / rate;
+      var f = def.f || last;
+      var nF = Math.max(1, Math.round(dur / FRAME_MS));
+
+      function push(fr) { frames.push(fr); last = [fr.f1, fr.f2, fr.f3]; }
+
+      if (def.t === 'v') {
+        var g = def.g || def.f;
+        var amp = item.s ? 1 : 0.82;
+        for (var i = 0; i < nF; i++) {
+          var k = nF === 1 ? 0 : i / (nF - 1);
+          var kk = k * k * (3 - 2 * k);                     /* smootherstep glide */
+          push({
+            f1: def.f[0] + (g[0] - def.f[0]) * kk,
+            f2: def.f[1] + (g[1] - def.f[1]) * kk,
+            f3: def.f[2] + (g[2] - def.f[2]) * kk,
+            av: amp * (i < 2 ? 0.7 : 1), af: 0, nf: 0, nbw: 0, stress: item.s
+          });
+        }
+      } else if (def.t === 'n' || def.t === 'l') {
+        var a = def.av || 0.6;
+        for (var j = 0; j < nF; j++) push({ f1: f[0], f2: f[1], f3: f[2], av: a, af: 0, nf: 0, nbw: 0 });
+      } else if (def.t === 'f') {
+        for (var k2 = 0; k2 < nF; k2++) {
+          var edge = Math.min(k2, nF - 1 - k2) < 1 ? 0.6 : 1;
+          push({ f1: f[0], f2: f[1], f3: f[2], av: def.voiced ? 0.22 : 0, af: def.na * edge, nf: def.nf, nbw: def.nbw });
+        }
+      } else if (def.t === 'h') {
+        var hv = nextVowelF(idx + 1);
+        for (var k3 = 0; k3 < nF; k3++) push({ f1: hv[0], f2: hv[1], f3: hv[2], av: 0, af: def.na, nf: hv[1], nbw: 1200 });
+      } else if (def.t === 'p') {
+        var closure = Math.max(1, Math.round((dur * 0.55) / FRAME_MS));
+        var burst = Math.max(1, Math.round(14 / FRAME_MS));
+        var asp = def.voiced || def.noAsp ? 0 : Math.max(1, Math.round(32 / rate / FRAME_MS));
+        for (var c = 0; c < closure; c++) {
+          push({ f1: def.voiced ? 220 : f[0], f2: f[1], f3: f[2], av: def.voiced ? 0.10 : 0, af: 0, nf: 0, nbw: 0 });
+        }
+        for (var b = 0; b < burst; b++) {
+          push({ f1: f[0], f2: f[1], f3: f[2], av: 0, af: def.na, nf: def.nf, nbw: def.nbw });
+        }
+        var av2 = nextVowelF(idx + 1);
+        for (var s2 = 0; s2 < asp; s2++) {
+          push({ f1: av2[0], f2: av2[1], f3: av2[2], av: 0, af: 0.16 * (1 - s2 / (asp + 1)), nf: av2[1], nbw: 1500 });
+        }
+      } else {   /* pause */
+        for (var q = 0; q < nF; q++) push({ f1: last[0], f2: last[1], f3: last[2], av: 0, af: 0, nf: 0, nbw: 0 });
+      }
+    });
+
+    /* zero-phase smoothing of the formant tracks: this is what turns
+       a string of targets into something that sounds co-articulated */
+    smooth(frames, ['f1', 'f2', 'f3'], 0.45);
+    smooth(frames, ['av'], 0.6);
+    return frames;
+  }
+
+  function smooth(frames, keys, alpha) {
+    var i, k;
+    for (k = 0; k < keys.length; k++) {
+      var key = keys[k];
+      for (i = 1; i < frames.length; i++) frames[i][key] = alpha * frames[i][key] + (1 - alpha) * frames[i - 1][key];
+      for (i = frames.length - 2; i >= 0; i--) frames[i][key] = alpha * frames[i][key] + (1 - alpha) * frames[i + 1][key];
+    }
+  }
+
+  /* ---------------------------------------------------------
+     5. Frames -> samples. Impulse-excited resonator cascade,
+     which is exactly the buzz espeak is known for.
+     --------------------------------------------------------- */
+  function Reson() { this.y1 = 0; this.y2 = 0; this.a = 1; this.b = 0; this.c = 0; }
+  Reson.prototype.set = function (freq, bw, sr) {
+    var r = Math.exp(-Math.PI * bw / sr);
+    this.c = -r * r;
+    this.b = 2 * r * Math.cos(2 * Math.PI * freq / sr);
+    this.a = 1 - this.b - this.c;
+  };
+  Reson.prototype.run = function (x) {
+    var y = this.a * x + this.b * this.y1 + this.c * this.y2;
+    this.y2 = this.y1; this.y1 = y;
+    return y;
+  };
+
+  /* Rosenberg glottal flow pulse, one period mapped onto 0..1 */
+  function glottalFlow(p) {
+    var t1 = 0.42, t2 = 0.58, x;
+    if (p < t1) { x = p / t1; return 3 * x * x - 2 * x * x * x; }
+    if (p < t2) { x = (p - t1) / (t2 - t1); return 1 - x * x; }
+    return 0;
+  }
+
+  function render(text, opts) {
+    opts = opts || {};
+    var sr = opts.sampleRate || 22050;
+    var rate = Math.max(0.3, Math.min(opts.rate || 1, 4));
+    var f0Base = Math.max(50, Math.min(opts.f0 || 118, 400));
+    var volume = opts.volume === undefined ? 1 : Math.max(0, Math.min(opts.volume, 1));
+    var tilt = opts.formantScale || 1;
+
+    var seq = opts.phones || textToPhones(text);
+    var frames = buildFrames(seq, rate);
+    if (!frames.length) return { sampleRate: sr, samples: new Float32Array(0), durationMs: 0 };
+
+    var spf = Math.round(sr * FRAME_MS / 1000);
+    var total = frames.length * spf;
+    var out = new Float32Array(total);
+
+    var r1 = new Reson(), r2 = new Reson(), r3 = new Reson(), rn = new Reson();
+    var phase = 0, lastPulse = 0, radPrev = 0, seed = 12345;
+    function noise() {                    /* deterministic, so tests repeat */
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return (seed / 0x3fffffff) - 1;
+    }
+
+    var nFrames = frames.length;
+    for (var i = 0; i < total; i++) {
+      var fpos = i / spf;
+      var fi = Math.min(nFrames - 1, Math.floor(fpos));
+      var fj = Math.min(nFrames - 1, fi + 1);
+      var t = fpos - fi;
+      var A = frames[fi], B = frames[fj];
+      var f1 = (A.f1 + (B.f1 - A.f1) * t) * tilt;
+      var f2 = (A.f2 + (B.f2 - A.f2) * t) * tilt;
+      var f3 = (A.f3 + (B.f3 - A.f3) * t) * tilt;
+      var av = A.av + (B.av - A.av) * t;
+      var af = A.af + (B.af - A.af) * t;
+      var nf = A.nf + (B.nf - A.nf) * t;
+      var nbw = A.nbw + (B.nbw - A.nbw) * t;
+
+      /* pitch: gentle declination, a lift on stressed frames, a
+         final fall, and a whisper of jitter so it is not a pure buzz */
+      var prog = i / total;
+      var f0 = f0Base * (1.05 - 0.16 * prog) * (A.stress ? 1.05 : 1);
+      if (prog > 0.88) f0 *= 1 - (prog - 0.88) * 1.4;
+      f0 *= 1 + noise() * 0.006;
+
+      var src = 0;
+      if (av > 0.001) {
+        phase += f0 / sr;
+        if (phase >= 1) phase -= 1;
+        /* Rosenberg glottal flow; the excitation is its derivative, so
+           the sharp closure gives the buzz and the shape gives the tilt */
+        var g = glottalFlow(phase);
+        src = (g - lastPulse) * av * 3.2;
+        lastPulse = g;
+        src += noise() * 0.012 * av;          /* a little breath */
+      }
+
+      r1.set(f1, f1 < 400 ? 55 : 70, sr);
+      r2.set(f2, 95, sr);
+      r3.set(f3, 160, sr);
+      var voiced = r3.run(r2.run(r1.run(src)));
+
+      var fric = 0;
+      if (af > 0.001) {
+        rn.set(Math.max(200, nf || 2000), Math.max(300, nbw || 1500), sr);
+        fric = rn.run(noise()) * af * 2.4;
+      }
+
+      /* lip radiation: the mouth differentiates the wave on the way out,
+         which is what lifts F2 and F3 into audibility */
+      var mixed = voiced * 1.15 + fric;
+      out[i] = mixed - radPrev * 0.94;
+      radPrev = mixed;
+    }
+
+    /* DC block, normalise, and fade the very ends so there is no click */
+    var dc = 0;
+    for (var d = 0; d < total; d++) dc += out[d];
+    dc /= total || 1;
+    var peak = 1e-6, energy = 0;
+    for (var n = 0; n < total; n++) {
+      out[n] -= dc;
+      energy += out[n] * out[n];
+      if (Math.abs(out[n]) > peak) peak = Math.abs(out[n]);
+    }
+    /* loudness-match on RMS so every phrase lands at the same level,
+       then back off if that would clip */
+    var rms = Math.sqrt(energy / (total || 1)) || 1e-6;
+    var gain = 0.14 / rms;
+    if (peak * gain > 0.94) gain = 0.94 / peak;
+    gain *= volume;
+    var fade = Math.min(Math.round(sr * 0.006), Math.floor(total / 2));
+    for (var m = 0; m < total; m++) {
+      var g = gain;
+      if (m < fade) g *= m / fade;
+      if (m > total - fade) g *= (total - m) / fade;
+      /* gentle soft clipping: tames the plosive spikes so the average
+         level can sit higher without the bursts distorting */
+      out[m] = Math.tanh(out[m] * g * 1.7) * 0.88;
+    }
+
+    return { sampleRate: sr, samples: out, durationMs: (total / sr) * 1000 };
+  }
+
+  /* ---------------------------------------------------------
+     6. Browser playback
+     --------------------------------------------------------- */
+  var audioCtx = null, current = null;
+
+  function context() {
+    if (typeof window === 'undefined') return null;
+    var Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return null;
+    if (!audioCtx) { try { audioCtx = new Ctor(); } catch (e) { return null; } }
+    if (audioCtx.state === 'suspended' && audioCtx.resume) { try { audioCtx.resume(); } catch (e) { } }
+    return audioCtx;
+  }
+
+  var api = {
+    /* is Web Audio usable at all? */
+    available: function () {
+      return typeof window !== 'undefined' && !!(window.AudioContext || window.webkitAudioContext);
+    },
+    phonemes: function (text) {
+      return textToPhones(text).map(function (x) { return x.p; }).join(' ');
+    },
+    render: render,
+    estimateMs: function (text, rate) {
+      var frames = buildFrames(textToPhones(text), Math.max(0.3, rate || 1));
+      return frames.length * FRAME_MS;
+    },
+    speak: function (text, opts) {
+      var ctx = context();
+      if (!ctx) return Promise.reject(new Error('no Web Audio'));
+      var pcm = render(text, {
+        sampleRate: ctx.sampleRate,
+        rate: (opts && opts.rate) || 1,
+        f0: (opts && opts.f0) || 118,
+        volume: (opts && opts.volume) === undefined ? 1 : opts.volume,
+        formantScale: (opts && opts.formantScale) || 1
+      });
+      if (!pcm.samples.length) return Promise.resolve();
+      var buf = ctx.createBuffer(1, pcm.samples.length, ctx.sampleRate);
+      buf.copyToChannel ? buf.copyToChannel(pcm.samples, 0) : buf.getChannelData(0).set(pcm.samples);
+      var src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      api.cancel();
+      current = src;
+      return new Promise(function (resolve) {
+        src.onended = function () { if (current === src) current = null; resolve(); };
+        try { src.start(); } catch (e) { resolve(); }
+      });
+    },
+    cancel: function () {
+      if (current) { try { current.stop(); } catch (e) { } current = null; }
+    }
+  };
+
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  if (root) root.SenseVoice = api;
+})(typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : this));
+</script>
+<script>
+/* ============================================================
+   SENSE FORGE — emulated Linux sound stack
+   ------------------------------------------------------------
+   The Year 9 temperature-alarm lab makes the Pi talk with
+
+       import os
+       os.system('espeak "23.4 degrees"')
+
+   so the emulator needs two things: an os module, and something
+   that behaves like espeak. Speech goes through the browser's
+   own speech synthesiser — no CDN, no network, nothing to
+   install — and falls back to a correctly timed silent pause on
+   machines with no voices installed or with the speaker off.
+
+   window.SenseShell is a tiny POSIX-ish command runner:
+   quoting, ;  &&  ||, exit statuses, and a handful of commands
+   students actually type. Everything else answers the way a
+   real shell does: "sh: 1: foo: not found" and status 127.
+   ============================================================ */
+(function () {
+  'use strict';
+
+  var ESPEAK_WPM = 175;      /* espeak's default speaking speed */
+  var HARD_CAP = 30000;      /* nothing blocks the program longer than this */
+  var noVoiceWarned = false;
+
+  var shell = {
+    onOutput: function () { },   /* the runner hooks writeConsole in here */
+    muted: false,
+    speaking: false,
+    lastSpoken: ''
+  };
+
+  /* ---------- environment helpers ---------- */
+  function hal() {
+    if (typeof window !== 'undefined' && window.SenseHAL) return window.SenseHAL;
+    if (typeof global !== 'undefined' && global.SenseHAL) return global.SenseHAL;
+    return null;
+  }
+  function interrupted() {
+    var h = hal();
+    return !!(h && h.interruptFlag && h.interruptFlag.on);
+  }
+  function synth() {
+    return (typeof window !== 'undefined' && window.speechSynthesis) ? window.speechSynthesis : null;
+  }
+  function Utter() {
+    return (typeof window !== 'undefined' && window.SpeechSynthesisUtterance) ? window.SpeechSynthesisUtterance : null;
+  }
+  function say(text, cls) { try { shell.onOutput(text, cls || 'sys'); } catch (e) { } }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function num(v, dflt) { var n = parseFloat(v); return isFinite(n) ? n : dflt; }
+
+  /* interruptible sleep — Stop still works while the Pi is "talking" */
+  function sleepMs(ms) {
+    return new Promise(function (resolve, reject) {
+      var t0 = Date.now();
+      (function tick() {
+        if (interrupted()) { reject(new Error('KeyboardInterrupt')); return; }
+        var left = ms - (Date.now() - t0);
+        if (left <= 0) { resolve(); return; }
+        setTimeout(tick, Math.min(left, 25));
+      })();
+    });
+  }
+
+  function led(on) {
+    shell.speaking = !!on;
+    if (typeof document === 'undefined') return;
+    var el = document.getElementById('spk-led');
+    if (el) { if (on) el.classList.add('on'); else el.classList.remove('on'); }
+  }
+
+  /* ---------- voices ---------- */
+  function allVoices() {
+    var s = synth();
+    if (!s || typeof s.getVoices !== 'function') return [];
+    try { return s.getVoices() || []; } catch (e) { return []; }
+  }
+  function pickVoice(name) {
+    var voices = allVoices();
+    if (!voices.length) return null;
+    var want = String(name || '').toLowerCase();
+    var wantFemale = /\+f|female/.test(want);
+    var base = want.replace(/^mb-/, '').split('+')[0];
+    if (base === 'english') base = 'en';
+    if (base === 'en-uk' || base === 'gb') base = 'en-gb';
+    var prefs;
+    if (!base || base === 'en') prefs = ['en-au', 'en-gb', 'en'];
+    else if (base.indexOf('en') === 0) prefs = [base, 'en'];
+    else prefs = [base.slice(0, 2)];
+    var pool = [];
+    prefs.forEach(function (p) {
+      voices.forEach(function (v) {
+        var l = String(v.lang || '').toLowerCase().replace('_', '-');
+        if (l.indexOf(p) === 0 && pool.indexOf(v) === -1) pool.push(v);
+      });
+    });
+    if (!pool.length) pool = voices.slice();
+    if (wantFemale) {
+      var f = pool.filter(function (v) {
+        return /female|zira|karen|samantha|fiona|catherine|hazel|susan|tessa|moira|serena|aria/i.test(v.name || '');
+      });
+      if (f.length) return f[0];
+    }
+    return pool[0];
+  }
+  function listVoices(ctx) {
+    var lines = ['Pty Language Voice Name'];
+    var V = voice();
+    if (V && V.available()) lines.push('  5  en-AU   sf-robot (built in, always available)');
+    allVoices().slice(0, 12).forEach(function (v) {
+      lines.push('  5  ' + String(v.lang || '?') + '   ' + String(v.name || '?'));
+    });
+    write(ctx, lines.join('\n') + '\n', 'out');
+    return 0;
+  }
+
+  /* ---------- how long would espeak have taken? ---------- */
+  function spokenWords(text) {
+    var t = String(text)
+      .replace(/(\d)[.,](\d)/g, '$1 point $2')
+      .replace(/\d/g, 'nine ')          /* espeak reads digits out one by one */
+      .replace(/[^\w\s']+/g, ' ');
+    var n = t.split(/\s+/).filter(Boolean).length;
+    return n || 1;
+  }
+  function estimateMs(text, rate) {
+    var V = voice();
+    if (V && V.estimateMs) {
+      try { return clamp(V.estimateMs(text, rate || 1), 200, HARD_CAP); } catch (e) { }
+    }
+    var wpm = ESPEAK_WPM * (rate || 1);
+    return clamp((spokenWords(text) / wpm) * 60000 + 220, 300, HARD_CAP);
+  }
+
+  /* ---------- the voice itself ----------
+     Three engines, tried in this order:
+       system  — the browser's speechSynthesis, where it works
+       builtin — SenseVoice, the formant synthesiser in this file
+       silent  — no audio at all: time the phrase and carry on
+     Chromium and Firefox on Linux only expose speechSynthesis voices
+     when speech-dispatcher is installed, which on a school image it
+     usually is not, so the built-in voice is what most Linux boxes
+     will end up using. Whichever engine speaks, the timing matches.
+     --------------------------------------- */
+  var engine = 'auto';
+  var engineNoted = false;
+
+  function voice() {
+    if (typeof window !== 'undefined' && window.SenseVoice) return window.SenseVoice;
+    if (typeof global !== 'undefined' && global.SenseVoice) return global.SenseVoice;
+    return null;
+  }
+  function systemUsable() {
+    var s = synth();
+    return !!(s && Utter() && allVoices().length);
+  }
+  function noteEngine(which) {
+    if (engineNoted || which === 'system') { engineNoted = true; return; }
+    engineNoted = true;
+    if (which === 'builtin') say('(no system voice here — using the built-in formant voice)\n', 'sys');
+    else say('(no audio available — the phrase is being timed silently)\n', 'sys');
+  }
+
+  function timedSilence(ms, which) {
+    if (which !== 'muted') noteEngine(which || 'silent');
+    return sleepMs(ms).then(
+      function () { led(false); },
+      function (e) { led(false); throw e; }
+    );
+  }
+
+  /* SenseVoice: renders the phrase to PCM and plays it through Web Audio */
+  function builtinSpeak(text, o, estimate) {
+    var V = voice();
+    if (!V || !V.available()) return timedSilence(estimate, 'silent');
+    noteEngine('builtin');
+    return new Promise(function (resolve, reject) {
+      var done = false, watch = null;
+      function finish(err) {
+        if (done) return;
+        done = true;
+        if (watch) clearInterval(watch);
+        led(false);
+        try { V.cancel(); } catch (e) { }
+        if (err) reject(err); else resolve();
+      }
+      watch = setInterval(function () {
+        if (interrupted()) finish(new Error('KeyboardInterrupt'));
+      }, 60);
+      var p;
+      try {
+        p = V.speak(text, { rate: o.rate, f0: o.f0, volume: o.volume, formantScale: o.formantScale });
+      } catch (e) { p = null; }
+      if (!p) {
+        done = true; clearInterval(watch);
+        timedSilence(estimate, 'silent').then(resolve, reject);
+        return;
+      }
+      p.then(function () { finish(); }, function () {
+        if (done) return;
+        done = true; clearInterval(watch);
+        timedSilence(estimate, 'silent').then(resolve, reject);
+      });
+    });
+  }
+
+  /* the browser's own synthesiser, when it has voices and actually starts */
+  function systemSpeak(text, o, estimate) {
+    var s = synth(), U = Utter();
+    return new Promise(function (resolve, reject) {
+      var done = false, started = false, t0 = Date.now(), watch = null, u;
+      var cap = clamp(estimate * 3 + 3000, 4000, HARD_CAP);
+
+      function stopWatch() { if (watch) { clearInterval(watch); watch = null; } }
+      function finish(err) {
+        if (done) return;
+        done = true; stopWatch(); led(false);
+        try { s.cancel(); } catch (e) { }
+        if (err) reject(err); else resolve();
+      }
+      /* Nothing came out: remember that for the rest of the session and
+         hand the same phrase to the built-in voice. */
+      function handOver() {
+        if (done) return;
+        done = true; stopWatch();
+        try { s.cancel(); } catch (e) { }
+        engine = 'builtin';
+        builtinSpeak(text, o, Math.max(0, estimate - (Date.now() - t0))).then(resolve, reject);
+      }
+
+      try { u = new U(text); } catch (e) { handOver(); return; }
+      u.rate = clamp(o.rate, 0.1, 10);
+      u.pitch = clamp(o.pitch, 0, 2);
+      u.volume = clamp(o.volume, 0, 1);
+      var v = pickVoice(o.voice);
+      if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = 'en-AU'; }
+      u.onstart = function () { started = true; };
+      u.onend = function () { finish(); };
+      u.onerror = function () { if (started) finish(); else handOver(); };
+
+      watch = setInterval(function () {
+        if (interrupted()) { finish(new Error('KeyboardInterrupt')); return; }
+        var elapsed = Date.now() - t0;
+        if (!started && elapsed > 1200) { handOver(); return; }
+        if (elapsed > cap) finish();
+      }, 100);
+
+      try {
+        s.cancel();
+        if (s.paused && typeof s.resume === 'function') s.resume();
+        s.speak(u);
+      } catch (e) { handOver(); }
+    });
+  }
+
+  function speak(text, o) {
+    o = o || {};
+    var opts = {
+      rate: clamp(num(o.rate, 1), 0.1, 10),
+      pitch: clamp(num(o.pitch, 1), 0, 2),
+      volume: clamp(num(o.volume, 1), 0, 1),
+      voice: o.voice || '',
+      f0: clamp(num(o.f0, 118), 50, 400),
+      formantScale: clamp(num(o.formantScale, 1), 0.8, 1.4)
+    };
+    var estimate = estimateMs(text, opts.rate);
+
+    shell.lastSpoken = text;
+    say('\uD83D\uDD0A espeak: ' + text + '\n', 'sys');
+    led(true);
+
+    if (shell.muted || !text) return timedSilence(estimate, 'muted');
+
+    var want = o.engine || engine;
+    if (want === 'system') return systemSpeak(text, opts, estimate);
+    if (want === 'builtin') return builtinSpeak(text, opts, estimate);
+    if (systemUsable()) return systemSpeak(text, opts, estimate);
+    engine = 'builtin';
+    return builtinSpeak(text, opts, estimate);
+  }
+
+  /* ---------- command line splitting ---------- */
+  function tokenise(line) {
+    var toks = [], cur = '', quote = null, has = false, i, ch;
+    for (i = 0; i < line.length; i++) {
+      ch = line.charAt(i);
+      if (quote) {
+        if (ch === quote) { quote = null; }
+        else if (ch === '\\' && quote === '"' && i + 1 < line.length && '"\\$`'.indexOf(line.charAt(i + 1)) !== -1) { cur += line.charAt(++i); }
+        else cur += ch;
+      } else if (ch === "'" || ch === '"') { quote = ch; has = true; }
+      else if (ch === '\\' && i + 1 < line.length) { cur += line.charAt(++i); has = true; }
+      else if (ch === ' ' || ch === '\t' || ch === '\n') { if (cur.length || has) { toks.push(cur); cur = ''; has = false; } }
+      else cur += ch;
+    }
+    if (quote) throw new Error('unterminated quote');
+    if (cur.length || has) toks.push(cur);
+    return toks;
+  }
+
+  function splitCommands(line) {
+    var segs = [], cur = '', pending = ';', quote = null, i, ch;
+    for (i = 0; i < line.length; i++) {
+      ch = line.charAt(i);
+      if (quote) { cur += ch; if (ch === quote) quote = null; continue; }
+      if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+      if (ch === ';') { segs.push({ op: pending, cmd: cur }); cur = ''; pending = ';'; continue; }
+      if (ch === '&' && line.charAt(i + 1) === '&') { segs.push({ op: pending, cmd: cur }); cur = ''; pending = '&&'; i++; continue; }
+      if (ch === '|' && line.charAt(i + 1) === '|') { segs.push({ op: pending, cmd: cur }); cur = ''; pending = '||'; i++; continue; }
+      cur += ch;
+    }
+    segs.push({ op: pending, cmd: cur });
+    return segs;
+  }
+
+  function write(ctx, text, cls) {
+    if (ctx && ctx.capture && cls !== 'err') ctx.out.push(text);
+    else say(text, cls || 'out');
+  }
+
+  /* ---------- espeak ---------- */
+  function nextValue(argv, state, inline) {
+    if (inline !== null && inline !== undefined && inline !== '') return inline;
+    state.i += 1;
+    return state.i < argv.length ? argv[state.i] : null;
+  }
+
+  function espeakCmd(argv, ctx) {
+    var o = { wpm: ESPEAK_WPM, pitch: 50, amp: 100, voice: '', wav: null, file: null, voicesOnly: false };
+    var words = [], state = { i: 1 }, a, name, value, parts;
+
+    for (; state.i < argv.length; state.i++) {
+      a = argv[state.i];
+      if (a === '--') { words = words.concat(argv.slice(state.i + 1)); break; }
+      if (a.length > 1 && a.charAt(0) === '-') {
+        if (a.indexOf('--') === 0) {
+          parts = a.slice(2).split('=');
+          name = parts[0];
+          value = parts.length > 1 ? parts.slice(1).join('=') : null;
+        } else {
+          name = a.charAt(1);
+          value = a.length > 2 ? a.slice(2) : null;
+        }
+        switch (name) {
+          case 's': case 'speed': o.wpm = num(nextValue(argv, state, value), ESPEAK_WPM); break;
+          case 'p': case 'pitch': o.pitch = num(nextValue(argv, state, value), 50); break;
+          case 'a': case 'amplitude': o.amp = num(nextValue(argv, state, value), 100); break;
+          case 'v': case 'voice': o.voice = nextValue(argv, state, value) || ''; break;
+          case 'w': o.wav = nextValue(argv, state, value); break;
+          case 'f': case 'file': o.file = nextValue(argv, state, value); break;
+          case 'g': case 'gap': case 'b': case 'k': case 'l': case 'punct': case 'path':
+            nextValue(argv, state, value); break;
+          case 'voices': o.voicesOnly = true; break;
+          default: break;   /* unknown switches are ignored, as espeak mostly does */
+        }
+      } else words.push(a);
+    }
+
+    if (o.voicesOnly) return Promise.resolve(listVoices(ctx));
+    if (o.file) {
+      write(ctx, 'espeak: Failed to read file ' + o.file + ' (the emulator has no file system)\n', 'err');
+      return Promise.resolve(1);
+    }
+    var text = words.join(' ').trim();
+    if (!text) {
+      say('espeak: no text given — put the words in quotes, e.g. espeak "hello"\n', 'sys');
+      return Promise.resolve(0);
+    }
+    if (o.wav) say('espeak: -w cannot write a file here — speaking out loud instead\n', 'sys');
+
+    var female = /\+f|female/i.test(o.voice);
+    var forced = /^(sf|robot|builtin)$/i.test(o.voice) ? 'builtin'
+      : (/^(system|browser)$/i.test(o.voice) ? 'system' : undefined);
+    /* espeak pitch is 0..99 around a default of 50; that maps onto a
+       fundamental of roughly 70..165 Hz, with a female voice an octave-ish
+       up and a shorter vocal tract (higher formants). */
+    var f0 = 70 + clamp(num(o.pitch, 50), 0, 99) * 0.96;
+    return speak(text, {
+      rate: (o.wpm || ESPEAK_WPM) / ESPEAK_WPM,
+      pitch: o.pitch / 50,
+      volume: o.amp / 100,
+      voice: o.voice,
+      f0: female ? f0 * 1.6 : f0,
+      formantScale: female ? 1.14 : 1,
+      engine: forced
+    }).then(function () { return 0; });
+  }
+
+  function spdSayCmd(argv, ctx) {
+    var o = { rate: 0, pitch: 0, voice: '' }, words = [], state = { i: 1 }, a, name, value;
+    for (; state.i < argv.length; state.i++) {
+      a = argv[state.i];
+      if (a.length > 1 && a.charAt(0) === '-') {
+        name = a.indexOf('--') === 0 ? a.slice(2) : a.charAt(1);
+        value = (a.indexOf('--') !== 0 && a.length > 2) ? a.slice(2) : null;
+        switch (name) {
+          case 'r': case 'rate': o.rate = num(nextValue(argv, state, value), 0); break;
+          case 'p': case 'pitch': o.pitch = num(nextValue(argv, state, value), 0); break;
+          case 't': case 'voice-type': o.voice = nextValue(argv, state, value) || ''; break;
+          case 'o': case 'l': case 'i': nextValue(argv, state, value); break;
+          default: break;
+        }
+      } else words.push(a);
+    }
+    var text = words.join(' ').trim();
+    if (!text) return Promise.resolve(0);
+    return speak(text, {
+      rate: clamp(1 + o.rate / 100, 0.1, 10),
+      pitch: clamp(1 + o.pitch / 100, 0, 2),
+      volume: 1,
+      voice: /female/i.test(o.voice) ? 'en+f3' : ''
+    }).then(function () { return 0; });
+  }
+
+  /* ---------- the rest of the little shell ---------- */
+  var NOTES = {
+    apt: 'the emulator has no package manager — espeak, python3 and the Sense HAT library are already installed',
+    audio: 'the emulator has no sound files — use espeak for sound',
+    python: 'SENSE FORGE is already running your program — it cannot launch a second Python',
+    power: 'there is no Pi to reboot — this one lives in a browser tab'
+  };
+
+  function runOne(argv, ctx) {
+    if (!argv.length) return Promise.resolve(0);
+    /* prefixes that just wrap another command */
+    while (argv.length && (argv[0] === 'sudo' || argv[0] === 'nohup' || argv[0] === 'time' || argv[0] === 'env')) {
+      argv = argv.slice(1);
+    }
+    if (!argv.length) return Promise.resolve(0);
+    if (argv[argv.length - 1] === '&') argv = argv.slice(0, -1);   /* no background jobs here */
+    if (!argv.length) return Promise.resolve(0);
+
+    var cmd = argv[0];
+    switch (cmd) {
+      case 'espeak':
+      case 'espeak-ng':
+        return espeakCmd(argv, ctx);
+      case 'spd-say':
+        return spdSayCmd(argv, ctx);
+      case 'echo': {
+        var args = argv.slice(1), nl = '\n';
+        if (args[0] === '-n') { args = args.slice(1); nl = ''; }
+        write(ctx, args.join(' ') + nl, 'out');
+        return Promise.resolve(0);
+      }
+      case 'sleep': {
+        var secs = num(argv[1], 0);
+        return sleepMs(clamp(secs * 1000, 0, HARD_CAP)).then(function () { return 0; });
+      }
+      case 'true': case ':': return Promise.resolve(0);
+      case 'false': return Promise.resolve(1);
+      case 'pwd': write(ctx, '/home/kali\n', 'out'); return Promise.resolve(0);
+      case 'whoami': write(ctx, 'kali\n', 'out'); return Promise.resolve(0);
+      case 'hostname': write(ctx, 'pi5\n', 'out'); return Promise.resolve(0);
+      case 'date': write(ctx, new Date().toString() + '\n', 'out'); return Promise.resolve(0);
+      case 'uname':
+        write(ctx, (argv.indexOf('-a') !== -1
+          ? 'Linux pi5 6.6.0-sense-forge #1 SMP aarch64 GNU/Linux'
+          : 'Linux') + '\n', 'out');
+        return Promise.resolve(0);
+      case 'apt': case 'apt-get': case 'pip': case 'pip3':
+        say(cmd + ': ' + NOTES.apt + '\n', 'sys');
+        return Promise.resolve(0);
+      case 'aplay': case 'paplay': case 'mpg123': case 'omxplayer': case 'cvlc': case 'speaker-test':
+        say(cmd + ': ' + NOTES.audio + '\n', 'sys');
+        return Promise.resolve(1);
+      case 'python': case 'python3': case 'idle3': case 'idle':
+        say(cmd + ': ' + NOTES.python + '\n', 'sys');
+        return Promise.resolve(1);
+      case 'reboot': case 'shutdown': case 'poweroff': case 'halt':
+        say(cmd + ': ' + NOTES.power + '\n', 'sys');
+        return Promise.resolve(1);
+      default:
+        write(ctx, 'sh: 1: ' + cmd + ': not found\n', 'err');
+        return Promise.resolve(127);
+    }
+  }
+
+  /* run a whole command line; resolves { status, stdout } */
+  shell.run = function (line, options) {
+    var ctx = { capture: !!(options && options.capture), out: [] };
+    var segs = splitCommands(String(line == null ? '' : line));
+    var status = 0;
+    var chain = Promise.resolve();
+    segs.forEach(function (seg) {
+      chain = chain.then(function () {
+        var text = seg.cmd.replace(/^\s+|\s+$/g, '');
+        if (!text) return;
+        if (seg.op === '&&' && status !== 0) return;
+        if (seg.op === '||' && status === 0) return;
+        var argv;
+        try { argv = tokenise(text); }
+        catch (e) {
+          write(ctx, 'sh: 1: Syntax error: Unterminated quoted string\n', 'err');
+          status = 2; return;
+        }
+        return runOne(argv, ctx).then(function (code) { status = code; });
+      });
+    });
+    return chain.then(function () { return { status: status, stdout: ctx.out.join('') }; });
+  };
+
+  shell.speak = speak;
+  shell.cancel = function () {
+    var s = synth();
+    if (s) { try { s.cancel(); } catch (e) { } }
+    var V = voice();
+    if (V) { try { V.cancel(); } catch (e) { } }
+    led(false);
+  };
+  shell.setMuted = function (m) {
+    shell.muted = !!m;
+    if (shell.muted) shell.cancel();
+  };
+  shell.resetSession = function () { noVoiceWarned = false; engineNoted = false; };
+  shell.setEngine = function (which) { engine = which || 'auto'; };
+
+  if (typeof window !== 'undefined') window.SenseShell = shell;
+  else if (typeof global !== 'undefined') global.SenseShell = shell;
+})();
+
+/* ============================================================
+   os — the slice of it that makes sense without a file system.
+   Registered through Sk.builtinFiles like sense_hat, so it is
+   stringified: it may only touch globals (window.SenseShell, Sk).
+   ============================================================ */
+var osBuiltinModule = function (name) {
+  var SHELL = (typeof window !== 'undefined' ? window.SenseShell : global.SenseShell);
+  var mod = { __name__: new Sk.builtin.str('os') };
+
+  function pyS(v) { return new Sk.builtin.str(v); }
+  function pyI(v) { return new Sk.builtin.int_(v); }
+  function js(v) { return Sk.ffi.remapToJs(v); }
+
+  function toSkError(e) {
+    var msg = String((e && e.message) || e);
+    if (/KeyboardInterrupt/.test(msg)) return new Sk.builtin.ExternalError('KeyboardInterrupt');
+    return new Sk.builtin.ExternalError(msg);
+  }
+
+  /* os.system — blocks like the real one, and returns the exit status */
+  mod.system = new Sk.builtin.func(function (command) {
+    if (!Sk.builtin.checkString(command)) {
+      throw new Sk.builtin.TypeError('system() argument must be str, not ' + Sk.abstr.typeName(command));
+    }
+    var p = SHELL.run(js(command)).then(
+      function (r) { return pyI(r.status); },
+      function (e) { throw toSkError(e); }
+    );
+    return Sk.misceval.promiseToSuspension(p);
+  });
+
+  mod.popen = new Sk.builtin.func(function () {
+    throw new Sk.builtin.NotImplementedError('os.popen() is not available in the emulator — use os.system() or subprocess.check_output()');
+  });
+
+  mod.name = pyS('posix');
+  mod.sep = pyS('/');
+  mod.altsep = Sk.builtin.none.none$;
+  mod.extsep = pyS('.');
+  mod.pathsep = pyS(':');
+  mod.linesep = pyS('\n');
+  mod.curdir = pyS('.');
+  mod.pardir = pyS('..');
+  mod.devnull = pyS('/dev/null');
+
+  mod.getcwd = new Sk.builtin.func(function () { return pyS('/home/kali'); });
+  mod.getlogin = new Sk.builtin.func(function () { return pyS('kali'); });
+  mod.getpid = new Sk.builtin.func(function () { return pyI(1); });
+  mod.uname = new Sk.builtin.func(function () {
+    return new Sk.builtin.tuple([pyS('Linux'), pyS('pi5'), pyS('6.6.0-sense-forge'), pyS('#1 SMP'), pyS('aarch64')]);
+  });
+
+  mod.environ = new Sk.builtin.dict([
+    pyS('HOME'), pyS('/home/kali'),
+    pyS('USER'), pyS('kali'),
+    pyS('SHELL'), pyS('/bin/bash'),
+    pyS('LANG'), pyS('en_AU.UTF-8'),
+    pyS('PATH'), pyS('/usr/local/bin:/usr/bin:/bin')
+  ]);
+  mod.getenv = new Sk.builtin.func(function (key, dflt) {
+    var found = mod.environ.mp$lookup(key);
+    if (found !== undefined) return found;
+    return dflt === undefined ? Sk.builtin.none.none$ : dflt;
+  });
+
+  ['listdir', 'remove', 'unlink', 'mkdir', 'makedirs', 'rmdir', 'rename',
+    'chdir', 'stat', 'walk', 'open', 'chmod'].forEach(function (fn) {
+      mod[fn] = new Sk.builtin.func(function () {
+        throw new Sk.builtin.NotImplementedError('os.' + fn + '() needs a real file system — the emulator runs entirely in the browser');
+      });
+    });
+
+  /* os.path — the handful of pure-string helpers that still make sense */
+  var pathMod = new Sk.builtin.module();
+  function joinParts() {
+    var out = '';
+    for (var i = 0; i < arguments.length; i++) {
+      var part = js(arguments[i]);
+      if (part === undefined || part === null) continue;
+      part = String(part);
+      if (part.charAt(0) === '/') out = part;
+      else if (!out || out.charAt(out.length - 1) === '/') out += part;
+      else out += '/' + part;
+    }
+    return pyS(out);
+  }
+  function tail(p) { var i = p.lastIndexOf('/'); return i === -1 ? p : p.slice(i + 1); }
+  pathMod.$d = {
+    __name__: pyS('os.path'),
+    sep: pyS('/'),
+    join: new Sk.builtin.func(joinParts),
+    basename: new Sk.builtin.func(function (p) { return pyS(tail(String(js(p)))); }),
+    dirname: new Sk.builtin.func(function (p) {
+      var s = String(js(p)), i = s.lastIndexOf('/');
+      return pyS(i === -1 ? '' : (i === 0 ? '/' : s.slice(0, i)));
+    }),
+    splitext: new Sk.builtin.func(function (p) {
+      var s = String(js(p)), base = tail(s), i = base.lastIndexOf('.');
+      if (i <= 0) return new Sk.builtin.tuple([pyS(s), pyS('')]);
+      return new Sk.builtin.tuple([pyS(s.slice(0, s.length - (base.length - i))), pyS(base.slice(i))]);
+    }),
+    abspath: new Sk.builtin.func(function (p) {
+      var s = String(js(p));
+      return pyS(s.charAt(0) === '/' ? s : '/home/kali/' + s);
+    }),
+    exists: new Sk.builtin.func(function () { return Sk.builtin.bool.false$; }),
+    isfile: new Sk.builtin.func(function () { return Sk.builtin.bool.false$; }),
+    isdir: new Sk.builtin.func(function () { return Sk.builtin.bool.false$; })
+  };
+  mod.path = pathMod;
+
+  /* Skulpt looks module attributes up by their mangled name, and a few
+     harmless words ('name', 'call', ...) collide with JavaScript keywords. */
+  mangleKeys(mod);
+  mangleKeys(pathMod.$d);
+
+  function mangleKeys(target) {
+    Object.keys(target).forEach(function (k) {
+      var m = Sk.fixReserved(k);
+      if (m !== k) { target[m] = target[k]; delete target[k]; }
+    });
+  }
+
+  return mod;
+};
+
+/* ============================================================
+   subprocess — call / check_call / check_output / run, all
+   routed through the same little shell as os.system.
+   ============================================================ */
+var subprocessBuiltinModule = function (name) {
+  var SHELL = (typeof window !== 'undefined' ? window.SenseShell : global.SenseShell);
+  var mod = { __name__: new Sk.builtin.str('subprocess') };
+
+  function pyS(v) { return new Sk.builtin.str(v); }
+  function pyI(v) { return new Sk.builtin.int_(v); }
+  function js(v) { return Sk.ffi.remapToJs(v); }
+
+  function quote(word) {
+    return /[^\w@%+=:,./-]/.test(word) ? "'" + word.replace(/'/g, "'\\''") + "'" : word;
+  }
+  /* subprocess.run(["espeak", "hello"]) and run("espeak hello", shell=True) */
+  function commandLine(arg) {
+    var v = js(arg);
+    if (typeof v === 'string') return v;
+    if (Array.isArray(v)) return v.map(function (w) { return quote(String(w)); }).join(' ');
+    throw new Sk.builtin.TypeError('argument must be a string or a list of strings');
+  }
+  function toSkError(e) {
+    var msg = String((e && e.message) || e);
+    if (/KeyboardInterrupt/.test(msg)) return new Sk.builtin.ExternalError('KeyboardInterrupt');
+    return new Sk.builtin.ExternalError(msg);
+  }
+  function shellRun(arg, capture) {
+    return SHELL.run(commandLine(arg), { capture: capture }).then(
+      function (r) { return r; },
+      function (e) { throw toSkError(e); }
+    );
+  }
+
+  /* instance attributes have to be written through Skulpt, not onto the JS object */
+  function setAttr(self, key, value) {
+    Sk.abstr.sattr(self, new Sk.builtin.str(key), value === undefined ? Sk.builtin.none.none$ : value, false);
+  }
+
+  var CalledProcessError = Sk.misceval.buildClass(mod, function ($gbl, $loc) {
+    $loc.__init__ = new Sk.builtin.func(function (self, returncode, cmd, output) {
+      self.$returncode = returncode;
+      self.$cmd = cmd || Sk.builtin.none.none$;
+      setAttr(self, 'returncode', returncode);
+      setAttr(self, 'cmd', self.$cmd);
+      setAttr(self, 'output', output);
+      setAttr(self, 'stdout', output);
+      return Sk.builtin.none.none$;
+    });
+    $loc.__str__ = new Sk.builtin.func(function (self) {
+      return pyS("Command '" + Sk.misceval.objectRepr(self.$cmd) + "' returned non-zero exit status " + js(self.$returncode) + '.');
+    });
+  }, 'CalledProcessError', [Sk.builtin.Exception]);
+  mod.CalledProcessError = CalledProcessError;
+
+  var CompletedProcess = Sk.misceval.buildClass(mod, function ($gbl, $loc) {
+    $loc.__init__ = new Sk.builtin.func(function (self, args, returncode, stdout) {
+      self.$args = args;
+      self.$returncode = returncode;
+      setAttr(self, 'args', args);
+      setAttr(self, 'returncode', returncode);
+      setAttr(self, 'stdout', stdout);
+      setAttr(self, 'stderr', Sk.builtin.none.none$);
+      return Sk.builtin.none.none$;
+    });
+    $loc.__repr__ = new Sk.builtin.func(function (self) {
+      return pyS('CompletedProcess(args=' + Sk.misceval.objectRepr(self.$args) + ', returncode=' + js(self.$returncode) + ')');
+    });
+    $loc.check_returncode = new Sk.builtin.func(function (self) {
+      if (js(self.$returncode) !== 0) {
+        throw Sk.misceval.callsimArray(CalledProcessError, [self.$returncode, self.$args]);
+      }
+      return Sk.builtin.none.none$;
+    });
+  }, 'CompletedProcess', []);
+  mod.CompletedProcess = CompletedProcess;
+
+  mod.PIPE = pyI(-1);
+  mod.STDOUT = pyI(-2);
+  mod.DEVNULL = pyI(-3);
+
+  /* every entry point is a fast call, so shell=True and friends are
+     accepted and quietly ignored the way they would be on the Pi */
+  function fastFunc(fn) { fn.co_fastcall = true; return new Sk.builtin.func(fn); }
+  function firstArg(args) { return args && args.length ? args[0] : Sk.builtin.none.none$; }
+  function kwarg(kwargs, key) {
+    for (var i = 0; kwargs && i < kwargs.length; i += 2) if (kwargs[i] === key) return kwargs[i + 1];
+    return undefined;
+  }
+
+  mod.call = fastFunc(function (args) {
+    var cmd = firstArg(args);
+    return Sk.misceval.promiseToSuspension(
+      shellRun(cmd, false).then(function (r) { return pyI(r.status); })
+    );
+  });
+
+  mod.check_call = fastFunc(function (args) {
+    var cmd = firstArg(args);
+    return Sk.misceval.promiseToSuspension(
+      shellRun(cmd, false).then(function (r) {
+        if (r.status !== 0) throw Sk.misceval.callsimArray(CalledProcessError, [pyI(r.status), cmd]);
+        return pyI(0);
+      })
+    );
+  });
+
+  mod.check_output = fastFunc(function (args) {
+    var cmd = firstArg(args);
+    return Sk.misceval.promiseToSuspension(
+      shellRun(cmd, true).then(function (r) {
+        if (r.status !== 0) throw Sk.misceval.callsimArray(CalledProcessError, [pyI(r.status), cmd, pyS(r.stdout)]);
+        return pyS(r.stdout);
+      })
+    );
+  });
+
+  mod.getoutput = fastFunc(function (args) {
+    return Sk.misceval.promiseToSuspension(
+      shellRun(firstArg(args), true).then(function (r) { return pyS(r.stdout.replace(/\n$/, '')); })
+    );
+  });
+
+  mod.run = fastFunc(function (args, kwargs) {
+    var cmd = firstArg(args);
+    var captureKw = kwarg(kwargs, 'capture_output');
+    var capture = (captureKw !== undefined && Sk.misceval.isTrue(captureKw)) || kwarg(kwargs, 'stdout') !== undefined;
+    var checkKw = kwarg(kwargs, 'check');
+    var check = checkKw !== undefined && Sk.misceval.isTrue(checkKw);
+    return Sk.misceval.promiseToSuspension(
+      shellRun(cmd, capture).then(function (r) {
+        if (check && r.status !== 0) throw Sk.misceval.callsimArray(CalledProcessError, [pyI(r.status), cmd, pyS(r.stdout)]);
+        return Sk.misceval.callsimArray(CompletedProcess, [cmd, pyI(r.status), capture ? pyS(r.stdout) : Sk.builtin.none.none$]);
+      })
+    );
+  });
+
+  mod.Popen = new Sk.builtin.func(function () {
+    throw new Sk.builtin.NotImplementedError('subprocess.Popen() is not available in the emulator — use subprocess.run() or os.system()');
+  });
+
+  Object.keys(mod).forEach(function (k) {
+    var m = Sk.fixReserved(k);          /* 'call' collides with a JS keyword */
+    if (m !== k) { mod[m] = mod[k]; delete mod[k]; }
+  });
+
+  return mod;
+};
+
+/* Registration helper — called next to registerSenseHatModule() */
+function registerShellModules() {
+  if (typeof Sk === 'undefined' || !Sk.builtinFiles) return;
+  Sk.builtinFiles['files']['src/lib/os.js'] = 'var $builtinmodule = ' + osBuiltinModule.toString();
+  Sk.builtinFiles['files']['src/lib/subprocess.js'] = 'var $builtinmodule = ' + subprocessBuiltinModule.toString();
+  /* the stock stubs raise NotImplementedError, and .py is searched after .js */
+  delete Sk.builtinFiles['files']['src/lib/os.py'];
+  delete Sk.builtinFiles['files']['src/lib/subprocess.py'];
+}
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { registerShellModules: registerShellModules };
+}
+</script>
+
+<script>
 var SENSE_FONT = {" ": [0, 0, 0, 0, 0], "+": [8, 8, 62, 8, 8], "-": [8, 8, 8, 8, 8], "*": [20, 8, 62, 8, 20], "/": [2, 4, 8, 16, 32], "!": [0, 0, 125, 0, 0], "\"": [0, 112, 0, 112, 0], "#": [20, 127, 20, 127, 20], "$": [18, 42, 127, 42, 36], ">": [0, 65, 34, 20, 8], "<": [8, 20, 34, 65, 0], "0": [62, 69, 73, 81, 62], "1": [0, 33, 127, 1, 0], "2": [33, 67, 69, 73, 49], "3": [66, 65, 81, 105, 70], "4": [12, 20, 36, 127, 4], "5": [114, 81, 81, 81, 78], "6": [30, 41, 73, 73, 6], "7": [64, 64, 79, 80, 96], "8": [54, 73, 73, 73, 54], "9": [48, 73, 73, 74, 60], ".": [0, 3, 3, 0, 0], "=": [20, 20, 20, 20, 20], ")": [0, 65, 34, 28, 0], "(": [0, 28, 34, 65, 0], "A": [63, 72, 72, 72, 63], "B": [127, 73, 73, 73, 54], "C": [62, 65, 65, 65, 34], "D": [127, 65, 65, 34, 28], "E": [127, 73, 73, 73, 65], "F": [127, 72, 72, 72, 64], "G": [62, 65, 73, 73, 47], "H": [127, 8, 8, 8, 127], "I": [0, 65, 127, 65, 0], "J": [2, 1, 65, 126, 64], "K": [127, 8, 20, 34, 65], "L": [127, 1, 1, 1, 1], "M": [127, 32, 24, 32, 127], "N": [127, 16, 8, 4, 127], "O": [62, 65, 65, 65, 62], "P": [127, 72, 72, 72, 48], "Q": [62, 65, 69, 66, 61], "R": [127, 72, 76, 74, 49], "S": [49, 73, 73, 73, 70], "T": [64, 64, 127, 64, 64], "U": [126, 1, 1, 1, 126], "V": [124, 2, 1, 2, 124], "W": [127, 2, 12, 2, 127], "X": [99, 20, 8, 20, 99], "Y": [96, 16, 15, 16, 96], "Z": [67, 69, 73, 81, 97], "a": [2, 21, 21, 21, 15], "b": [126, 9, 17, 17, 14], "c": [14, 17, 17, 17, 2], "d": [14, 17, 17, 9, 127], "e": [14, 21, 21, 21, 12], "f": [0, 8, 63, 72, 32], "g": [8, 21, 21, 21, 30], "h": [127, 8, 16, 16, 15], "i": [0, 17, 95, 1, 0], "j": [2, 1, 1, 94, 0], "k": [0, 127, 4, 10, 17], "l": [0, 65, 127, 1, 0], "m": [31, 16, 15, 16, 15], "n": [31, 8, 16, 16, 15], "o": [14, 17, 17, 17, 14], "p": [31, 20, 20, 20, 8], "q": [8, 20, 20, 20, 31], "r": [0, 31, 8, 16, 16], "s": [9, 21, 21, 21, 18], "t": [0, 16, 62, 17, 2], "u": [30, 1, 1, 2, 31], "v": [28, 2, 1, 2, 28], "w": [30, 1, 6, 1, 30], "x": [17, 18, 14, 9, 17], "y": [17, 9, 6, 4, 24], "z": [17, 19, 21, 25, 17], "?": [32, 64, 69, 72, 48], ",": [0, 5, 6, 0, 0], ";": [0, 53, 54, 0, 0], ":": [0, 54, 54, 0, 0], "|": [0, 0, 127, 0, 0], "@": [38, 73, 79, 65, 62], "%": [98, 100, 8, 19, 35], "[": [0, 127, 65, 65, 0], "&": [54, 73, 85, 34, 5], "_": [1, 1, 1, 1, 1], "'": [0, 80, 96, 0, 0], "]": [0, 65, 65, 127, 0], "\\": [32, 16, 8, 4, 2], "~": [8, 16, 24, 8, 16]};
 /* ============================================================
    SenseHAL — emulated hardware state. DOM-agnostic: rendering
@@ -15266,6 +16805,33 @@ var SENSE_EXAMPLES = {
     "        break"
   ].join("\n"),
 
+  "Talking temperature alarm": [
+    "# Year 9 lab, part 3 — traffic light + voice.",
+    "# Drag the temperature slider to cross your two numbers.",
+    "from sense_hat import SenseHat",
+    "import time",
+    "import os",
+    "",
+    "sense = SenseHat()",
+    "sense.low_light = True",
+    "",
+    "NUMBER_A = 26   # below this it is blue",
+    "NUMBER_B = 29   # above this it is red",
+    "",
+    "while True:",
+    "    temp = sense.get_temperature()",
+    "    temp = round(temp, 1)",
+    "    print(temp)",
+    "    if temp < NUMBER_A:",
+    "        sense.clear(0, 0, 255)",
+    "    elif temp < NUMBER_B:",
+    "        sense.clear(0, 255, 0)",
+    "    else:",
+    "        sense.clear(255, 0, 0)",
+    "    os.system('espeak \"' + str(temp) + ' degrees\"')",
+    "    time.sleep(5)"
+  ].join("\n"),
+
   "Low light + rotation demo": [
     "from sense_hat import SenseHat",
     "import time",
@@ -15806,6 +17372,8 @@ var SENSE_DEFAULT_PROGRAM = [
     if (window.SenseBench) window.SenseBench.consoleDirty('');
   }
   $('btn-clear-console').addEventListener('click', clearConsole);
+  /* the emulated shell (espeak, echo, ...) prints through the same console */
+  if (window.SenseShell) window.SenseShell.onOutput = writeConsole;
 
   var pendingInput = null;
   function askInput(prompt) {
@@ -16061,6 +17629,8 @@ var SENSE_DEFAULT_PROGRAM = [
     Sk.TurtleGraphics = { target: 'gfx-host', width: 620, height: 420 };
     registerSenseHatModule();
     registerExtraModules();
+    registerShellModules();
+    if (window.SenseShell) { window.SenseShell.cancel(); window.SenseShell.resetSession(); }
 
     var code = editor.getValue();
     Sk.misceval.asyncToPromise(function () {
@@ -16083,6 +17653,7 @@ var SENSE_DEFAULT_PROGRAM = [
 
   function finishRun(cls, text) {
     running = false;
+    if (window.SenseShell) window.SenseShell.cancel();
     $('btn-run').disabled = false;
     $('btn-stop').disabled = true;
     setStatus(cls, text);
@@ -16094,6 +17665,7 @@ var SENSE_DEFAULT_PROGRAM = [
   function stopProgram(silent) {
     if (!running) return;
     HAL.interruptFlag.on = true;
+    if (window.SenseShell) window.SenseShell.cancel();
     if (pendingInput) { var p = pendingInput; pendingInput = null; p.reject(); }
     if (!silent) setStatus('idle', 'stopping…');
   }
@@ -16196,6 +17768,22 @@ var SENSE_DEFAULT_PROGRAM = [
   $('btn-level').addEventListener('click', function () { window.SenseSetOrientation(0, 0, 0); });
   $('btn-att-reset').addEventListener('click', function () { window.SenseSetOrientation(0, 0, 0); });
   $('cb-noise').addEventListener('change', function () { HAL.noise = $('cb-noise').checked; });
+
+  /* Speaker toggle: muting keeps the espeak timing, it just stops the sound,
+     so a program behaves identically in a quiet classroom. */
+  (function () {
+    var cb = $('cb-speaker');
+    if (!cb || !window.SenseShell) return;
+    try {
+      var saved = localStorage.getItem('senseforge.speaker');
+      if (saved !== null) cb.checked = (saved === 'on');
+    } catch (e) { }
+    window.SenseShell.setMuted(!cb.checked);
+    cb.addEventListener('change', function () {
+      window.SenseShell.setMuted(!cb.checked);
+      try { localStorage.setItem('senseforge.speaker', cb.checked ? 'on' : 'off'); } catch (e) { }
+    });
+  })();
 
   /* Motion checkbox mirrors the bench drag mode, matching the reference
      emulator where ticking Motion is what lets you tilt the board. */
